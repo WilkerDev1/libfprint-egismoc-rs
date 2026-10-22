@@ -1,33 +1,33 @@
-name: Reporte de Bug (Bug Report)
-description: Reporta un fallo con el lector de huellas en Arch Linux u otra distribución
+name: Bug Report
+description: Report a bug or authentication issue with an Egis Match-on-Chip fingerprint sensor
 title: "[Bug]: "
 labels: ["bug"]
 body:
   - type: input
     id: device_id
     attributes:
-      label: ID USB del Sensor (lsusb)
-      description: Ejecuta `lsusb | grep -i -E "1c7a|egis|lightuning"` y pega la salida
+      label: Sensor USB ID (lsusb)
+      description: Run `lsusb | grep -i -E "1c7a|egis|lightuning"` and paste the output
       placeholder: "Bus 003 Device 002: ID 1c7a:0582 LighTuning Technology Inc. ETU905A80-E"
     validations:
       required: true
   - type: input
     id: laptop_model
     attributes:
-      label: Modelo de Laptop y Distribución
+      label: Laptop Model & Linux Distribution
       placeholder: "Samsung Galaxy Book2 Pro 360 (930QED) - Arch Linux"
     validations:
       required: true
   - type: textarea
     id: description
     attributes:
-      label: ¿Qué sucede y cómo reproducirlo?
-      description: Describe si ocurre en `fprintd-enroll`, `fprintd-verify`, `sudo` o pantalla de bloqueo (GDM/GNOME).
+      label: What happened and how to reproduce it?
+      description: Describe whether the issue happens during `fprintd-enroll`, `fprintd-verify`, `sudo`, or the desktop lock screen (GDM/GNOME).
     validations:
       required: true
   - type: textarea
     id: logs
     attributes:
-      label: Registros de fprintd (journalctl)
-      description: Salida de `journalctl -u fprintd -n 50 --no-pager`
+      label: fprintd Logs (journalctl)
+      description: Output of `journalctl -u fprintd -n 50 --no-pager`
       render: shell

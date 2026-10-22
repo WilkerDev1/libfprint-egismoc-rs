@@ -1,22 +1,22 @@
-# Política de Seguridad (Security Policy)
+# Security Policy
 
-## Versiones Soportadas
+## Supported Versions
 
-| Versión | Soporte de Seguridad |
+| Version | Supported |
 | :--- | :--- |
-| `main` (`0.1.x`) | :white_check_mark: Activo |
+| `main` (`0.1.x`) | :white_check_mark: Active |
 
-## Arquitectura de Seguridad del Driver
+## Security Architecture
 
-`libfprint-egismoc-rs` implementa el protocolo **Microsoft SDCP (Secure Device Connection Protocol)** en espacio de usuario para sensores biométricos Match-on-Chip Egis Technology (`1c7a:0582` – `1c7a:05a5`):
+`libfprint-egismoc-rs` implements **Microsoft SDCP (Secure Device Connection Protocol)** in userspace for Egis Technology Match-on-Chip biometric sensors (`1c7a:0582` – `1c7a:05a5`):
 
-- **Aislamiento de memoria (Sans-I/O en Rust)**: Todo el parseo de paquetes USB, validación ASN.1 DER (`cert_m`), derivación de claves SP800-108 KBKDF (`HMAC-SHA256`) e intercambio ECDH `P-256` está escrito en Rust seguro sin bloques `unsafe` en los módulos de protocolo ni máquina de estados.
-- **Borrado criptográfico en RAM (`Drop`)**: `SdcpSession` sobrescribe con ceros (`write_volatile` + `compiler_fence`) las claves privadas efímeras (`host_private_key`), `key_agreement`, `master_secret` y `application_secret` al cerrarse o invalidarse la sesión.
-- **Comparación de MACs en tiempo constante**: Las etiquetas HMAC-SHA256 de `ConnectResponse`, `ReconnectResponse` y `AuthorizedIdentity` se verifican en tiempo constante (`constant_time_eq_32`).
-- **Permisos estrictos en caché**: El archivo de sesión `/var/lib/fprint/egismoc/<serial>/sdcp-claim` se escribe con permisos `0600` (y directorio `0700`) y expira al cambiar `/proc/sys/kernel/random/boot_id` o tras 24 horas.
+- **Memory Isolation (Sans-I/O in Rust)**: All USB packet framing, ASN.1 DER length validation (`cert_m`), SP800-108 Counter Mode KBKDF (`HMAC-SHA256`), and ECDH `P-256` key agreement are written in safe Rust with zero `unsafe` blocks in the protocol or state-machine modules.
+- **Deterministic RAM Zeroization (`Drop`)**: `SdcpSession` overwrites ephemeral private keys (`host_private_key`), `key_agreement`, `master_secret`, and `application_secret` with zeros (`write_volatile` + `compiler_fence(Ordering::SeqCst)`) when dropped or invalidated.
+- **Constant-Time MAC Verification**: All 32-byte HMAC-SHA256 tags (`ConnectResponse`, `ReconnectResponse`, and `AuthorizedIdentity`) are compared in constant time (`constant_time_eq_32`).
+- **Hardened Cache File Permissions**: Cached SDCP claims (`/var/lib/fprint/egismoc/<serial>/sdcp-claim`) are written with strict `0600` file permissions (and `0700` directory permissions), validated against `/proc/sys/kernel/random/boot_id`, and expire after 24 hours of monotonic uptime.
 
-## Reportar una Vulnerabilidad
+## Reporting a Vulnerability
 
-Si descubres una vulnerabilidad de seguridad (por ejemplo, en el parseo de tramas USB, manejo de sesiones SDCP o frontera FFI), **no abras un Issue público**.
+If you discover a security issue (e.g., in USB frame parsing, SDCP session handling, or the FFI boundary), **please do not open a public issue**.
 
-Por favor repórtala de forma privada a través de la pestaña **[Security → Report a vulnerability](https://github.com/WilkerDev1/libfprint-egismoc-rs/security/advisories/new)** de este repositorio (GitHub Private Vulnerability Reporting).
+Instead, report it privately via **[Security → Report a vulnerability](https://github.com/WilkerDev1/libfprint-egismoc-rs/security/advisories/new)** (GitHub Private Vulnerability Reporting).

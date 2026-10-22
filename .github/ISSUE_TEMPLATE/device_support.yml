@@ -1,24 +1,24 @@
-name: Solicitud de Soporte para Nuevo Sensor Egis (Device Support)
-description: Solicita soporte para otra variante USB de Egis Technology (1c7a:xxxx)
+name: New Egis Sensor Support Request (Device Support)
+description: Request support for another Egis Technology (1c7a:xxxx) USB fingerprint sensor variant
 title: "[Device Support]: 1c7a:"
 labels: ["enhancement", "hardware"]
 body:
   - type: input
     id: usb_id
     attributes:
-      label: Salida de lsusb
+      label: lsusb Output
       placeholder: "ID 1c7a:0583 LighTuning Technology Inc."
     validations:
       required: true
   - type: input
     id: laptop
     attributes:
-      label: Marca y Modelo de Laptop
+      label: Laptop Brand & Model
       placeholder: "Samsung Galaxy Book3 Pro / ASUS ExpertBook / etc."
     validations:
       required: true
   - type: textarea
     id: details
     attributes:
-      label: Salida de `lsusb -v -d 1c7a:` o información adicional
+      label: Output of `lsusb -v -d 1c7a:` or additional details
       render: shell
