@@ -24,6 +24,7 @@ pkgbase = libfprint-egismoc-rs-git
 	provides = libfprint-2.so
 	conflicts = libfprint
 	conflicts = libfprint-egismoc-sdcp-git
+	replaces = libfprint-egismoc-sdcp-git
 	source = libfprint-egismoc-rs::git+https://github.com/WilkerDev1/libfprint-egismoc-rs.git
 	source = libfprint-egismoc-sdcp::git+https://github.com/TenSeventy7/libfprint-egismoc-sdcp.git
 	sha256sums = SKIP
