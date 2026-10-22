@@ -1,0 +1,10 @@
+# Build artifacts
+/build/
+/pkg/
+/pkg_build/
+/src/
+/libfprint-egismoc-sdcp/
+/egismoc-core/target/
+*.pkg.tar.zst
+*.pkg.tar.xz
+*.log

@@ -1,0 +1,44 @@
+name: CI & Security Audit
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  rust-core:
+    name: Rust Core (Test, Clippy & Format)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: egismoc-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "egismoc-core -> target"
+      - name: Run Clippy (strict)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Run Unit Tests
+        run: cargo test --verbose
+      - name: Build Release Staticlib
+        run: cargo build --release
+
+  security-audit:
+    name: Cargo Security Audit (RustSec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: egismoc-core

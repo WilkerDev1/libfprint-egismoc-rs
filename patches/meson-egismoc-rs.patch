@@ -1,0 +1,51 @@
+diff --git a/libfprint/meson.build b/libfprint/meson.build
+index 0b4d468..2c7d418 100644
+--- a/libfprint/meson.build
++++ b/libfprint/meson.build
+@@ -229,6 +229,13 @@ drivers_sources += configure_file(input: 'empty_file',
+         '\n'.join(drivers_type_list + [] + drivers_type_func)
+     ])
+ 
++egismoc_rs_dep = declare_dependency(
++    include_directories: include_directories('drivers/egismoc'),
++    link_args: [
++        meson.project_source_root() / '../egismoc-core/target/release/libegismoc_core.a',
++    ],
++)
++
+ deps = [
+     enums_dep,
+     gio_dep,
+@@ -236,6 +243,7 @@ deps = [
+     gobject_dep,
+     gusb_dep,
+     mathlib_dep,
++    egismoc_rs_dep,
+ ] + optional_deps
+ 
+ # These are empty and only exist so that the include directories are created
+diff --git a/meson.build b/meson.build
+index e78539c..5624e19 100644
+--- a/meson.build
++++ b/meson.build
+@@ -211,6 +211,7 @@ driver_helper_mapping = {
+     'aes3500' : [ 'aeslib', 'aes3k' ],
+     'aes4000' : [ 'aeslib', 'aes3k' ],
+     'uru4000' : [ 'openssl' ],
++    'egismoc' : [ 'openssl' ],
+     'elanspi' : [ 'udev' ],
+     'virtual_image'          : [ 'virtual' ],
+     'virtual_device'         : [ 'virtual' ],
+diff --git a/tests/meson.build b/tests/meson.build
+index 9e3efeb..4dc49cf 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -336,7 +336,7 @@ appstreamcli = find_program('appstreamcli', required: false)
+ if appstreamcli.found()
+     test('metainfo-validate',
+         appstreamcli,
+-        args: ['validate', metainfo_generator],
++        args: ['validate', '--no-net', metainfo_generator],
+         depends: metainfo_generator,
+         suite: ['data', 'no-valgrind'],
+     )

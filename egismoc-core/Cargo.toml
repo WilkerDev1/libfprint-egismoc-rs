@@ -1,0 +1,22 @@
+[package]
+name = "egismoc-core"
+version = "0.1.0"
+edition = "2021"
+description = "Sans-I/O Rust driver core and Microsoft SDCP implementation for Egis Match-on-Chip (1c7a:0582) fingerprint sensors"
+license = "LGPL-2.1-or-later"
+
+[lib]
+name = "egismoc_core"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+p256 = { version = "0.13", default-features = false, features = ["ecdh", "arithmetic"] }
+hmac = "0.12"
+sha2 = "0.10"
+getrandom = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
