@@ -11,7 +11,7 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 p256 = { version = "0.13", default-features = false, features = ["ecdh", "arithmetic"] }
-hmac = "0.12"
+hmac = "0.13"
 sha2 = "0.10"
 getrandom = "0.2"
 
