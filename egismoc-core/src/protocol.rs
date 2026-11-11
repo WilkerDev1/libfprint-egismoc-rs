@@ -52,7 +52,13 @@ pub const CMD_LIST: [u8; 11] = [
     0x00, 0x00, 0x00, 0x07, 0x50, 0x19, 0x04, 0x00, 0x00, 0x01, 0x40,
 ];
 
-pub const CMD_SENSOR_RESET: [u8; 8] = [0x00, 0x00, 0x00, 0x04, 0x50, 0x1a, 0x00, 0x00];
+/// Estado final de una respuesta `cmd_list` con al menos un `enrollment_id`.
+pub const RSP_LIST_SUCCESS_SUFFIX: [u8; 2] = [0x90, 0x00];
+/// Estado que devuelve el sensor cuando no tiene ninguna huella registrada
+/// (payload de longitud 2 sin IDs).
+pub const RSP_LIST_EMPTY_STATUS: [u8; 2] = [0x65, 0xfe];
+
+pub const CMD_SENSOR_RESET:[u8; 8] = [0x00, 0x00, 0x00, 0x04, 0x50, 0x1a, 0x00, 0x00];
 
 pub const CMD_SENSOR_CHECK: [u8; 8] = [0x00, 0x00, 0x00, 0x04, 0x50, 0x17, 0x02, 0x00];
 
@@ -322,26 +328,59 @@ pub fn build_new_print_payload(enrollment_id: &[u8; SDCP_ENROLLMENT_ID_SIZE]) ->
 }
 
 /// Extrae la lista de `enrollment_id` de 32 bytes de la respuesta a `cmd_list`
-/// (`egismoc_list_fill_enrolled_ids_cb`), excluyendo los 2 bytes de sufijo `90 00`.
+/// (`egismoc_list_fill_enrolled_ids_cb`).
+///
+/// Formato observado en hardware real (`tests/egismoc*/custom.pcapng`):
+///
+/// ```text
+/// "SIGE" 00 00 00 01 | check(2) | len(4, BE) | enrollment_id(32) * n | 90 00   (n >= 1)
+/// "SIGE" 00 00 00 01 | check(2) | 00 00 00 02 | 65 fe                         (sin huellas)
+/// ```
+///
+/// El parseo es estricto a propósito: una respuesta de error, truncada o con un
+/// estado desconocido **no** debe interpretarse como "lista vacía". Si se hiciera,
+/// identify/verify devolverían `FP_DEVICE_ERROR_DATA_NOT_FOUND` y `fprintd`
+/// borraría del disco todas las huellas almacenadas
+/// ("Deleted stored finger ... as it is unknown to device").
 pub fn parse_list_response(buffer_in: &[u8]) -> Result<Vec<[u8; SDCP_ENROLLMENT_ID_SIZE]>, ProtocolError> {
-    if buffer_in.len() < EGISMOC_READ_PREFIX.len() {
+    if buffer_in.len() < EGISMOC_LIST_RESPONSE_PREFIX_SIZE + EGISMOC_LIST_RESPONSE_SUFFIX_SIZE {
         return Err(ProtocolError::PacketTooShort);
     }
-    if buffer_in.len() < EGISMOC_LIST_RESPONSE_PREFIX_SIZE + EGISMOC_LIST_RESPONSE_SUFFIX_SIZE {
+    if buffer_in[..EGISMOC_READ_PREFIX.len()] != EGISMOC_READ_PREFIX {
+        return Err(ProtocolError::InvalidPrefix);
+    }
+
+    let len_start = EGISMOC_READ_PREFIX.len() + EGISMOC_CHECK_BYTES_LENGTH;
+    let mut len_be = [0u8; 4];
+    len_be.copy_from_slice(&buffer_in[len_start..EGISMOC_LIST_RESPONSE_PREFIX_SIZE]);
+    let declared_len = u32::from_be_bytes(len_be) as usize;
+
+    if declared_len < EGISMOC_LIST_RESPONSE_SUFFIX_SIZE {
+        return Err(ProtocolError::UnrecognizedResponse);
+    }
+    let Some(frame_end) = EGISMOC_LIST_RESPONSE_PREFIX_SIZE.checked_add(declared_len) else {
+        return Err(ProtocolError::UnrecognizedResponse);
+    };
+    if frame_end > buffer_in.len() {
+        return Err(ProtocolError::PacketTooShort);
+    }
+
+    let status = &buffer_in[frame_end - EGISMOC_LIST_RESPONSE_SUFFIX_SIZE..frame_end];
+    let payload = &buffer_in[EGISMOC_LIST_RESPONSE_PREFIX_SIZE..frame_end - EGISMOC_LIST_RESPONSE_SUFFIX_SIZE];
+
+    if payload.is_empty() && status == RSP_LIST_EMPTY_STATUS {
         return Ok(Vec::new());
     }
-
-    let payload_end = buffer_in.len() - EGISMOC_LIST_RESPONSE_SUFFIX_SIZE;
-    let mut ids = Vec::new();
-    let mut pos = EGISMOC_LIST_RESPONSE_PREFIX_SIZE;
-    while pos + SDCP_ENROLLMENT_ID_SIZE <= payload_end {
-        let mut id = [0u8; SDCP_ENROLLMENT_ID_SIZE];
-        id.copy_from_slice(&buffer_in[pos..pos + SDCP_ENROLLMENT_ID_SIZE]);
-        ids.push(id);
-        pos += SDCP_ENROLLMENT_ID_SIZE;
+    if status != RSP_LIST_SUCCESS_SUFFIX {
+        return Err(ProtocolError::InvalidSuffix);
+    }
+    if payload.is_empty() || !payload.len().is_multiple_of(SDCP_ENROLLMENT_ID_SIZE) {
+        return Err(ProtocolError::UnrecognizedResponse);
     }
 
-    Ok(ids)
+    let (ids, rest) = payload.as_chunks::<SDCP_ENROLLMENT_ID_SIZE>();
+    debug_assert!(rest.is_empty());
+    Ok(ids.to_vec())
 }
 
 /// Parsea la respuesta del comando `identify_check` (`egismoc_identify_check_cb`).
@@ -432,6 +471,79 @@ pub fn parse_fw_version_response(buffer_in: &[u8]) -> Result<String, ProtocolErr
 mod tests {
     use super::*;
 
+    /// Construye una respuesta `cmd_list` con el campo de longitud correcto.
+    fn list_frame(ids: &[&[u8; SDCP_ENROLLMENT_ID_SIZE]], status: &[u8; 2]) -> Vec<u8> {
+        let payload_len = ids.len() * SDCP_ENROLLMENT_ID_SIZE + status.len();
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&EGISMOC_READ_PREFIX);
+        frame.extend_from_slice(&[0x00, 0x00]); // check bytes (no validados en lectura)
+        frame.extend_from_slice(&(payload_len as u32).to_be_bytes());
+        for id in ids {
+            frame.extend_from_slice(*id);
+        }
+        frame.extend_from_slice(status);
+        frame
+    }
+
+    #[test]
+    fn test_parse_list_real_empty_response() {
+        // Capturado de hardware real (1c7a:0582) sin huellas registradas.
+        let rsp = [
+            0x53, 0x49, 0x47, 0x45, 0x00, 0x00, 0x00, 0x01, 0xff, 0x6f, 0x00, 0x00, 0x00, 0x02,
+            0x65, 0xfe,
+        ];
+        assert_eq!(parse_list_response(&rsp), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn test_parse_list_ignores_trailing_bytes_after_declared_length() {
+        let id = [0x33u8; 32];
+        let mut rsp = list_frame(&[&id], &RSP_LIST_SUCCESS_SUFFIX);
+        rsp.extend_from_slice(&[0u8; 7]);
+        assert_eq!(parse_list_response(&rsp), Ok(vec![id]));
+    }
+
+    #[test]
+    fn test_parse_list_error_status_is_not_an_empty_list() {
+        // Regresión: una respuesta de error (p. ej. tras un reset USB) se
+        // interpretaba como "0 huellas" -> DATA_NOT_FOUND -> fprintd borraba
+        // las huellas almacenadas en /var/lib/fprint.
+        for status in [[0x6a, 0x80], [0x69, 0x85], [0x90, 0x04]] {
+            let rsp = list_frame(&[], &status);
+            assert!(parse_list_response(&rsp).is_err(), "status {status:02x?}");
+        }
+        // `90 00` sin ningún ID tampoco es un vacío legítimo.
+        assert!(parse_list_response(&list_frame(&[], &RSP_LIST_SUCCESS_SUFFIX)).is_err());
+    }
+
+    #[test]
+    fn test_parse_list_rejects_truncated_and_malformed_frames() {
+        let id = [0x44u8; 32];
+        let full = list_frame(&[&id, &id], &RSP_LIST_SUCCESS_SUFFIX);
+
+        // Truncada en cualquier punto -> error, nunca lista vacía o parcial.
+        for cut in [0, 8, 13, 15, 16, 40, full.len() - 1] {
+            assert!(parse_list_response(&full[..cut]).is_err(), "cut at {cut}");
+        }
+
+        // Prefijo incorrecto.
+        let mut bad_prefix = full.clone();
+        bad_prefix[0] = b'E';
+        assert_eq!(parse_list_response(&bad_prefix), Err(ProtocolError::InvalidPrefix));
+
+        // Payload que no es múltiplo de 32 bytes.
+        let mut odd = list_frame(&[&id], &RSP_LIST_SUCCESS_SUFFIX);
+        odd.insert(EGISMOC_LIST_RESPONSE_PREFIX_SIZE, 0xaa);
+        let len = (SDCP_ENROLLMENT_ID_SIZE + 1 + 2) as u32;
+        odd[10..14].copy_from_slice(&len.to_be_bytes());
+        assert_eq!(parse_list_response(&odd), Err(ProtocolError::UnrecognizedResponse));
+
+        // Longitud declarada absurda.
+        let mut huge = full.clone();
+        huge[10..14].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(parse_list_response(&huge).is_err());
+    }
+
     #[test]
     fn test_cmd_fw_version_and_cmd_list_wrapping_and_checksums() {
         // Verifica que el cálculo de checksum de 16 bits en complemento a uno
@@ -506,11 +618,7 @@ mod tests {
     fn test_parse_list_and_identify_responses() {
         let id1 = [0x11u8; 32];
         let id2 = [0x22u8; 32];
-        let mut list_rsp = vec![0u8; EGISMOC_LIST_RESPONSE_PREFIX_SIZE];
-        list_rsp[..8].copy_from_slice(&EGISMOC_READ_PREFIX);
-        list_rsp.extend_from_slice(&id1);
-        list_rsp.extend_from_slice(&id2);
-        list_rsp.extend_from_slice(&[0x90, 0x00]);
+        let list_rsp = list_frame(&[&id1, &id2], &RSP_LIST_SUCCESS_SUFFIX);
 
         let parsed_ids = parse_list_response(&list_rsp).unwrap();
         assert_eq!(parsed_ids, vec![id1, id2]);

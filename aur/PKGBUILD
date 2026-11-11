@@ -4,7 +4,7 @@
 
 pkgname=libfprint-egismoc-rs-git
 pkgver=r1831.4d128d4
-pkgrel=1
+pkgrel=2
 pkgdesc="Library for fingerprint readers with Rust Sans-I/O SDCP driver for EgisTec egismoc sensors (1c7a:0582 - 1c7a:05a5)"
 url="https://github.com/WilkerDev1/libfprint-egismoc-rs"
 arch=(x86_64)

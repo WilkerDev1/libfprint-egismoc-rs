@@ -1074,9 +1074,9 @@ mod tests {
     use super::*;
     use crate::protocol::{
         EGISMOC_ENROLL_STARTING_RESPONSE_PREFIX_SIZE, EGISMOC_IDENTIFY_RESPONSE_PREFIX_SIZE,
-        EGISMOC_LIST_RESPONSE_PREFIX_SIZE, EGISMOC_READ_PREFIX, RSP_ENROLL_STARTING_SUFFIX,
+        EGISMOC_READ_PREFIX, RSP_ENROLL_STARTING_SUFFIX,
         RSP_FW_VERSION_SUFFIX, RSP_IDENTIFY_MATCH_SUFFIX, RSP_READ_SUCCESS_SUFFIX,
-        RSP_SENSOR_HAS_FINGER_SUFFIX,
+        RSP_LIST_EMPTY_STATUS, RSP_LIST_SUCCESS_SUFFIX, RSP_SENSOR_HAS_FINGER_SUFFIX,
     };
 
     fn make_ok_resp() -> Vec<u8> {
@@ -1085,10 +1085,52 @@ mod tests {
         v
     }
 
+    /// Respuesta `cmd_list` con el formato real del sensor (ver `parse_list_response`).
+    fn make_list_resp(ids: &[[u8; 32]]) -> Vec<u8> {
+        let mut v = EGISMOC_READ_PREFIX.to_vec();
+        v.extend_from_slice(&[0x00, 0x00]);
+        v.extend_from_slice(&((ids.len() * 32 + 2) as u32).to_be_bytes());
+        for id in ids {
+            v.extend_from_slice(id);
+        }
+        if ids.is_empty() {
+            v.extend_from_slice(&RSP_LIST_EMPTY_STATUS);
+        } else {
+            v.extend_from_slice(&RSP_LIST_SUCCESS_SUFFIX);
+        }
+        v
+    }
+
     fn make_interrupt_finger_present() -> Vec<u8> {
         let mut v = EGISMOC_READ_PREFIX.to_vec();
         v.extend_from_slice(&RSP_SENSOR_HAS_FINGER_SUFFIX);
         v
+    }
+
+    #[test]
+    fn test_identify_list_error_never_reports_data_not_found() {
+        // Regresión: DATA_NOT_FOUND hace que fprintd borre las huellas guardadas.
+        // Solo una lista vacía legítima (`65 fe`) puede producirlo.
+        let mut drv = EgisMocDriver::from_pid(0x0582);
+        drv.task = Some(TaskState::Identify {
+            step: IdentifyStep::WaitEnrolledIds,
+        });
+        let mut err_rsp = EGISMOC_READ_PREFIX.to_vec();
+        err_rsp.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x6a, 0x80]);
+        match drv.step(Some(&err_rsp)) {
+            Action::Error(DriverError::DataNotFound(_)) => panic!("error status treated as empty list"),
+            Action::Error(_) => {}
+            other => panic!("Unexpected {:?}", other),
+        }
+
+        let mut drv = EgisMocDriver::from_pid(0x0582);
+        drv.task = Some(TaskState::Identify {
+            step: IdentifyStep::WaitEnrolledIds,
+        });
+        match drv.step(Some(&make_list_resp(&[]))) {
+            Action::Error(DriverError::DataNotFound(_)) => {}
+            other => panic!("Unexpected {:?}", other),
+        }
     }
 
     #[test]
@@ -1146,10 +1188,7 @@ mod tests {
             other => panic!("Unexpected {:?}", other),
         }
 
-        let mut list_rsp = vec![0u8; EGISMOC_LIST_RESPONSE_PREFIX_SIZE];
-        list_rsp[..8].copy_from_slice(&EGISMOC_READ_PREFIX);
-        list_rsp.extend_from_slice(&id1);
-        list_rsp.extend_from_slice(&[0x90, 0x00]);
+        let list_rsp = make_list_resp(&[id1]);
 
         match drv.step(Some(&list_rsp)) {
             Action::TaskComplete(TaskResult::ListComplete { enrolled_ids }) => {
@@ -1219,10 +1258,7 @@ mod tests {
         let _ = std::fs::remove_file(&tmp_claim);
 
         let id1 = [0x77u8; 32];
-        let mut list_rsp = vec![0u8; EGISMOC_LIST_RESPONSE_PREFIX_SIZE];
-        list_rsp[..8].copy_from_slice(&EGISMOC_READ_PREFIX);
-        list_rsp.extend_from_slice(&id1);
-        list_rsp.extend_from_slice(&[0x90, 0x00]);
+        let list_rsp = make_list_resp(&[id1]);
 
         // 1. Probar cancelación limpia en medio de espera de dedo
         drv.start_identify();
@@ -1319,7 +1355,7 @@ mod tests {
             enrollment_id: [0u8; 32],
         });
 
-        let empty_list = vec![0u8; EGISMOC_LIST_RESPONSE_PREFIX_SIZE + 2];
+        let empty_list = make_list_resp(&[]);
         let _ = drv.step(Some(&empty_list)); // CMD_SENSOR_RESET
         let _ = drv.step(Some(&make_ok_resp())); // CMD_SENSOR_ENROLL
         let _ = drv.step(Some(&make_ok_resp())); // WaitFingerOnSensor
