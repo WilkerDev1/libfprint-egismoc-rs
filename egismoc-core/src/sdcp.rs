@@ -5,21 +5,25 @@
 //! - Intercambio de llaves efímeras ECDH sobre curva NIST P-256 (`secp256r1`).
 //! - Derivación SP800-108 Counter Mode KBKDF con HMAC-SHA256 (`master secret` y `application keys`).
 //! - Parseo seguro de longitud ASN.1 DER (`cert_m`) y de tramas `ConnectResponse`.
-//! - Verificación criptográfica de `ConnectResponse`, `ReconnectResponse` y `AuthorizedIdentity`.
+//! - Verificación criptográfica en tiempo constante (`subtle`) de `ConnectResponse`, `ReconnectResponse` y `AuthorizedIdentity`.
+//! - Limpieza garantizada de secretos en RAM (`zeroize`) sin bloques `unsafe`.
 //! - Tolerancia explícita a reinicios de bus USB (`IdentityVerification::MacMismatchAfterReset`).
 //! - Generación de `enrollment_id` de 32 bytes.
 
-use hmac::{Hmac, Mac};
+#![forbid(unsafe_code)]
+
+use crate::is_emulation_mode;
+use hmac::{Hmac, KeyInit, Mac};
 use p256::ecdh::diffie_hellman;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::{PublicKey, SecretKey};
 use sha2::{Digest, Sha256};
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::ptr;
-use std::sync::atomic::{compiler_fence, Ordering};
+use subtle::ConstantTimeEq;
+use zeroize::Zeroize;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -266,7 +270,7 @@ pub fn get_cert_length_from_buf(buf: &[u8]) -> Result<usize, SdcpError> {
 /// Genera 32 bytes aleatorios criptográficamente seguros (`r_h`, nonces).
 pub fn generate_random() -> Result<[u8; SDCP_RANDOM_SIZE], SdcpError> {
     let mut buf = [0u8; SDCP_RANDOM_SIZE];
-    getrandom::getrandom(&mut buf).map_err(|_| SdcpError::RngFailure)?;
+    getrandom::fill(&mut buf).map_err(|_| SdcpError::RngFailure)?;
     Ok(buf)
 }
 
@@ -302,35 +306,43 @@ pub fn kbkdf_counter_hmac_sha256(
     out
 }
 
-/// Comparación en tiempo constante para MACs de 32 bytes.
+/// Comparación en tiempo constante para MACs de 32 bytes respaldada por `subtle`
+/// (con barreras de optimización para impedir que LLVM la convierta en ramas).
+#[inline]
 fn constant_time_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    let mut diff = 0u8;
-    for i in 0..32 {
-        diff |= a[i] ^ b[i];
-    }
-    diff == 0
+    bool::from(a.ct_eq(b))
 }
 
-/// Limpia un buffer sensible en RAM usando escrituras volátiles para evitar que el optimizador las elimine.
-fn zeroize_slice(buf: &mut [u8]) {
-    for b in buf.iter_mut() {
-        unsafe {
-            ptr::write_volatile(b, 0);
-        }
-    }
-    compiler_fence(Ordering::SeqCst);
-}
-
-/// Obtiene el tiempo monotónico actual del sistema en microsegundos leyendo `/proc/uptime`.
+/// Obtiene el tiempo monotónico actual del sistema en microsegundos leyendo `/proc/uptime`
+/// con aritmética entera exacta (sin redondeo `f64`).
 fn monotonic_time_usec() -> i64 {
-    if let Ok(contents) = fs::read_to_string("/proc/uptime") {
-        if let Some(first) = contents.split_whitespace().next() {
-            if let Ok(secs) = first.parse::<f64>() {
-                return (secs * 1_000_000.0) as i64;
-            }
+    let Ok(contents) = fs::read_to_string("/proc/uptime") else {
+        return 1_000_000;
+    };
+    let Some(first) = contents.split_whitespace().next() else {
+        return 1_000_000;
+    };
+    let (secs_str, frac_str) = first.split_once('.').unwrap_or((first, ""));
+    let Ok(secs) = secs_str.parse::<i64>() else {
+        return 1_000_000;
+    };
+
+    // Tomar hasta 6 dígitos decimales (microsegundos) rellenando a la derecha con ceros.
+    let mut frac_usec: i64 = 0;
+    let mut digits = 0u32;
+    for b in frac_str.bytes().take(6) {
+        if !b.is_ascii_digit() {
+            break;
         }
+        frac_usec = frac_usec * 10 + i64::from(b - b'0');
+        digits += 1;
     }
-    1_000_000
+    while digits < 6 {
+        frac_usec *= 10;
+        digits += 1;
+    }
+
+    secs.saturating_mul(1_000_000).saturating_add(frac_usec)
 }
 
 const SDCP_CLAIM_EXPIRATION_USEC: i64 = 86_400 * 1_000_000;
@@ -380,12 +392,12 @@ impl SdcpSession {
 
     /// Borra de forma determinista todas las llaves privadas y secretos de sesión en RAM.
     pub fn zeroize_secrets(&mut self) {
-        zeroize_slice(&mut self.host_private_key);
-        zeroize_slice(&mut self.host_random);
-        zeroize_slice(&mut self.key_agreement);
-        zeroize_slice(&mut self.master_secret);
-        zeroize_slice(&mut self.application_secret);
-        zeroize_slice(&mut self.application_symmetric_key);
+        self.host_private_key.zeroize();
+        self.host_random.zeroize();
+        self.key_agreement.zeroize();
+        self.master_secret.zeroize();
+        self.application_secret.zeroize();
+        self.application_symmetric_key.zeroize();
     }
 
     /// Invalida la sesión actual y elimina el archivo `sdcp-claim` en caché para forzar
@@ -408,7 +420,12 @@ impl SdcpSession {
     pub fn default_claim_cache_path(driver: &str, device_id: &str) -> PathBuf {
         let base = std::env::var("STATE_DIRECTORY")
             .ok()
-            .and_then(|val| val.split(':').next().filter(|s| !s.is_empty()).map(PathBuf::from))
+            .and_then(|val| {
+                val.split(':')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from)
+            })
             .unwrap_or_else(|| std::env::temp_dir().join(".libfprint"));
         base.join(driver).join(device_id).join("sdcp-claim")
     }
@@ -425,19 +442,22 @@ impl SdcpSession {
             SecretKey::from_slice(pk_bytes).map_err(|_| SdcpError::InvalidPrivateKey)?
         } else {
             let mut candidate = [0u8; SDCP_PRIVATE_KEY_SIZE];
-            loop {
-                getrandom::getrandom(&mut candidate).map_err(|_| SdcpError::RngFailure)?;
+            let sk = loop {
+                getrandom::fill(&mut candidate).map_err(|_| SdcpError::RngFailure)?;
                 if let Ok(sk) = SecretKey::from_slice(&candidate) {
                     break sk;
                 }
-            }
+            };
+            candidate.zeroize();
+            sk
         };
 
-        let sk_bytes = secret_key.to_bytes();
+        let mut sk_bytes = secret_key.to_bytes();
         self.host_private_key.copy_from_slice(&sk_bytes);
+        sk_bytes.zeroize();
 
         let public_key = secret_key.public_key();
-        let encoded_pub = public_key.to_encoded_point(false);
+        let encoded_pub = public_key.to_sec1_point(false);
         let pub_bytes = encoded_pub.as_bytes();
         if pub_bytes.len() != SDCP_PUBLIC_KEY_SIZE {
             return Err(SdcpError::InvalidPublicKey);
@@ -510,7 +530,7 @@ impl SdcpSession {
         rnd.copy_from_slice(&data[97..129]);
 
         let res = self.set_host_keys(Some(&priv_key), Some(&rnd));
-        zeroize_slice(&mut priv_key);
+        priv_key.zeroize();
         res?;
         if self.host_public_key != pub_key {
             return Err(SdcpError::InvalidPublicKey);
@@ -519,7 +539,8 @@ impl SdcpSession {
         self.key_agreement.copy_from_slice(&data[129..161]);
         self.master_secret.copy_from_slice(&data[161..193]);
         self.application_secret.copy_from_slice(&data[193..225]);
-        self.application_symmetric_key.copy_from_slice(&data[225..257]);
+        self.application_symmetric_key
+            .copy_from_slice(&data[225..257]);
         self.is_connected = true;
         Ok(())
     }
@@ -554,15 +575,39 @@ impl SdcpSession {
             0x01, 0x01, 0xe1, 0x00, 0xc1, 0x00, 0xa1, 0x00, 0x81, 0x00, 0x61, 0x00, 0x20, 0x00,
         ]);
 
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(|_| SdcpError::IoError)?;
-        let write_res = file.write_all(&buf).map_err(|_| SdcpError::IoError);
-        zeroize_slice(&mut buf);
+        // Escritura atómica resistente a ataques de symlink: O_CREAT | O_EXCL (create_new)
+        // con sufijo aleatorio + permisos 0600 + fsync + rename.
+        let mut nonce = [0u8; 8];
+        getrandom::fill(&mut nonce).map_err(|_| SdcpError::RngFailure)?;
+        let nonce_u64 = u64::from_le_bytes(nonce);
+        let tmp_name = format!(
+            ".{}.tmp.{}.{:016x}",
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("sdcp-claim"),
+            std::process::id(),
+            nonce_u64
+        );
+        let tmp_path = path.with_file_name(tmp_name);
+
+        let write_res = (|| -> Result<(), SdcpError> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp_path)
+                .map_err(|_| SdcpError::IoError)?;
+            file.write_all(&buf).map_err(|_| SdcpError::IoError)?;
+            file.sync_all().map_err(|_| SdcpError::IoError)?;
+            drop(file);
+            fs::rename(&tmp_path, path).map_err(|_| SdcpError::IoError)?;
+            Ok(())
+        })();
+
+        buf.zeroize();
+        if write_res.is_err() {
+            let _ = fs::remove_file(&tmp_path);
+        }
         write_res
     }
 
@@ -611,8 +656,8 @@ impl SdcpSession {
         }
 
         // 2. ECDH P-256 entre host_private_key y firmware_public_key (pk_f)
-        let host_sk =
-            SecretKey::from_slice(&self.host_private_key).map_err(|_| SdcpError::InvalidPrivateKey)?;
+        let host_sk = SecretKey::from_slice(&self.host_private_key)
+            .map_err(|_| SdcpError::InvalidPrivateKey)?;
         let fw_pk = PublicKey::from_sec1_bytes(&resp.firmware_public_key)
             .map_err(|_| SdcpError::InvalidPublicKey)?;
 
@@ -625,16 +670,18 @@ impl SdcpSession {
         context[..SDCP_RANDOM_SIZE].copy_from_slice(&self.host_random);
         context[SDCP_RANDOM_SIZE..].copy_from_slice(&resp.device_random);
 
-        let master = kbkdf_counter_hmac_sha256(
+        let mut master = kbkdf_counter_hmac_sha256(
             &self.key_agreement,
             b"master secret",
             Some(&context),
             SDCP_MASTER_SECRET_SIZE,
         );
         self.master_secret.copy_from_slice(&master);
+        master.zeroize();
+        context.zeroize();
 
         // 4. Application keys: KBKDF(master_secret, "application keys", None, 64)
-        let app_keys = kbkdf_counter_hmac_sha256(
+        let mut app_keys = kbkdf_counter_hmac_sha256(
             &self.master_secret,
             b"application keys",
             None,
@@ -644,6 +691,7 @@ impl SdcpSession {
             .copy_from_slice(&app_keys[..SDCP_APPLICATION_SECRET_SIZE]);
         self.application_symmetric_key
             .copy_from_slice(&app_keys[SDCP_APPLICATION_SECRET_SIZE..]);
+        app_keys.zeroize();
 
         // 5. Claim hash = SHA256(cert_m || pk_d || pk_f || h_f || s_m || s_d)
         let mut hasher = Sha256::new();
@@ -664,7 +712,9 @@ impl SdcpSession {
         let mut expected_mac = [0u8; SDCP_DIGEST_SIZE];
         expected_mac.copy_from_slice(&expected_mac_bytes);
 
-        if !constant_time_eq_32(&resp.mac, &expected_mac) {
+        let matched = constant_time_eq_32(&resp.mac, &expected_mac);
+        expected_mac.zeroize();
+        if !matched {
             self.is_connected = false;
             return Err(SdcpError::MacVerificationFailed);
         }
@@ -726,12 +776,14 @@ impl SdcpSession {
         let mut expected = [0u8; SDCP_DIGEST_SIZE];
         expected.copy_from_slice(&expected_bytes);
 
-        if constant_time_eq_32(device_identify_mac, &expected) {
+        let matched = constant_time_eq_32(device_identify_mac, &expected);
+        expected.zeroize();
+        if matched {
             IdentityVerification::Verified
         } else {
             // Auto-reparación criptográfica: invalidar el claim obsoleto en caché para que
             // la próxima operación realice un nuevo handshake SDCP Connect con el sensor.
-            if std::env::var("FP_DEVICE_EMULATION").as_deref() != Ok("1") {
+            if !is_emulation_mode() {
                 self.invalidate_session();
             }
             IdentityVerification::MacMismatchAfterReset

@@ -2,7 +2,12 @@
 //! de 16 bits en complemento a uno (`egismoc_write_check_bytes`) y parseadores de respuestas
 //! para lectores de huellas Egis Technology Match-on-Chip (`1c7a:0582` y familia).
 
-use crate::sdcp::{SDCP_DIGEST_SIZE, SDCP_ENROLLMENT_ID_SIZE, SDCP_NONCE_SIZE, SDCP_PUBLIC_KEY_SIZE, SDCP_RANDOM_SIZE};
+#![forbid(unsafe_code)]
+
+use crate::sdcp::{
+    SDCP_DIGEST_SIZE, SDCP_ENROLLMENT_ID_SIZE, SDCP_NONCE_SIZE, SDCP_PUBLIC_KEY_SIZE,
+    SDCP_RANDOM_SIZE,
+};
 
 pub const EGISMOC_DRIVER_FULLNAME: &str = "Egis Technology (LighTuning) Match-on-Chip";
 
@@ -52,7 +57,19 @@ pub const CMD_LIST: [u8; 11] = [
     0x00, 0x00, 0x00, 0x07, 0x50, 0x19, 0x04, 0x00, 0x00, 0x01, 0x40,
 ];
 
+/// Estado final de una respuesta `cmd_list` con al menos un `enrollment_id`.
+pub const RSP_LIST_SUCCESS_SUFFIX: [u8; 2] = [0x90, 0x00];
+/// Estado que devuelve el sensor cuando no tiene ninguna huella registrada
+/// (payload de longitud 2 sin IDs).
+pub const RSP_LIST_EMPTY_STATUS: [u8; 2] = [0x65, 0xfe];
+
 pub const CMD_SENSOR_RESET: [u8; 8] = [0x00, 0x00, 0x00, 0x04, 0x50, 0x1a, 0x00, 0x00];
+/// Estado estándar de comando aceptado (`90 00`).
+pub const RSP_STATUS_OK: [u8; 2] = [0x90, 0x00];
+/// Estado devuelto por el sensor al armar espera de dedo (`50 17 01 xx` / `50 16 02 01`).
+pub const RSP_STATUS_ARMED: [u8; 2] = [0x91, 0x00];
+/// Estado `90 04` (sin coincidencia / commit-starting en hardware real).
+pub const RSP_STATUS_NO_MATCH: [u8; 2] = [0x90, 0x04];
 
 pub const CMD_SENSOR_CHECK: [u8; 8] = [0x00, 0x00, 0x00, 0x04, 0x50, 0x17, 0x02, 0x00];
 
@@ -126,6 +143,15 @@ pub enum IdentifyCheckResult {
     NoMatch,
 }
 
+/// Resultado de `enroll_check` para detectar huellas duplicadas antes de enrolar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrollCheckResult {
+    /// El chip respondió `90 04` (huella aún no registrada -> continuar).
+    NotEnrolled,
+    /// El chip respondió `90 00` (huella ya registrada -> duplicado).
+    AlreadyEnrolled,
+}
+
 /// Resultado de una captura parcial durante `Enroll`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureReadStatus {
@@ -174,6 +200,34 @@ pub fn wrap_egui_frame(payload: &[u8]) -> Vec<u8> {
     frame
 }
 
+/// Verifica que una trama completa (`EGIS` o `SIGE`) satisfaga el checksum de 16 bits
+/// en complemento a uno (`egismoc_write_check_bytes(frame) == 0xFFFF`).
+pub fn verify_frame_checksum(frame: &[u8]) -> bool {
+    frame.len() >= EGISMOC_READ_PREFIX.len() + EGISMOC_CHECK_BYTES_LENGTH
+        && egismoc_write_check_bytes(frame) == 0xFFFF
+}
+
+/// Valida una respuesta `SIGE` de acuse de recibo (`CMD_SENSOR_RESET`, `CMD_SENSOR_IDENTIFY`,
+/// `CMD_SENSOR_ENROLL`, `CMD_SENSOR_CHECK`, `CMD_SENSOR_START_CAPTURE`, `CMD_CAPTURE_POST_WAIT_FINGER`,
+/// `CMD_COMMIT_STARTING`), comprobando prefijo `SIGE`, longitud coherente y código de estado permitido.
+pub fn validate_sige_ack(
+    buffer_in: &[u8],
+    allowed_statuses: &[[u8; 2]],
+) -> Result<(), ProtocolError> {
+    if buffer_in.len() < EGISMOC_READ_PREFIX.len() + EGISMOC_CHECK_BYTES_LENGTH + 2 {
+        return Err(ProtocolError::PacketTooShort);
+    }
+    if buffer_in[..EGISMOC_READ_PREFIX.len()] != EGISMOC_READ_PREFIX {
+        return Err(ProtocolError::InvalidPrefix);
+    }
+    let status = &buffer_in[buffer_in.len() - 2..];
+    if allowed_statuses.iter().any(|s| s.as_slice() == status) {
+        Ok(())
+    } else {
+        Err(ProtocolError::InvalidSuffix)
+    }
+}
+
 /// Valida que el payload leído comience (después de los 8 bytes `SIGE...` y 2 check bytes) con `valid_prefix`.
 pub fn validate_response_prefix(buffer_in: &[u8], valid_prefix: &[u8]) -> bool {
     let start = EGISMOC_READ_PREFIX.len() + EGISMOC_CHECK_BYTES_LENGTH;
@@ -219,34 +273,25 @@ pub fn build_sdcp_connect_payload(
 /// Construye el payload (sin envolver) del comando `Delete` (`egismoc_get_delete_cmd`)
 /// para uno o varios `enrollment_id` de 32 bytes.
 pub fn build_delete_payload(ids_to_delete: &[[u8; SDCP_ENROLLMENT_ID_SIZE]]) -> Vec<u8> {
-    let num = ids_to_delete.len();
-    let total_len = 6 + CMD_DELETE_PREFIX.len() + SDCP_ENROLLMENT_ID_SIZE * num;
+    let ids_len = ids_to_delete
+        .len()
+        .checked_mul(SDCP_ENROLLMENT_ID_SIZE)
+        .expect("delete payload size overflow");
+    let ids_bytes = u16::try_from(ids_len).expect("delete payload exceeds u16");
+    let outer_len = ids_bytes
+        .checked_add(0x07)
+        .expect("delete outer length exceeds u16");
+    let total_len = 6 + CMD_DELETE_PREFIX.len() + ids_len;
     let mut out = Vec::with_capacity(total_len);
 
     // 1) 00 00
     out.extend_from_slice(&[0x00, 0x00]);
-
-    // 2) 2-byte size indicator: num * 0x20 + 0x07
-    if num > 7 {
-        out.push(0x01);
-        out.push((((num - 8) * 0x20) + 0x07) as u8);
-    } else {
-        out.push(0x00);
-        out.push(((num * 0x20) + 0x07) as u8);
-    }
-
+    // 2) 2-byte big-endian size indicator: num * 0x20 + 0x07
+    out.extend_from_slice(&outer_len.to_be_bytes());
     // 3) cmd_delete_prefix
     out.extend_from_slice(&CMD_DELETE_PREFIX);
-
-    // 4) 2-byte size indicator: num * 0x20
-    if num > 7 {
-        out.push(0x01);
-        out.push(((num - 8) * 0x20) as u8);
-    } else {
-        out.push(0x00);
-        out.push((num * 0x20) as u8);
-    }
-
+    // 4) 2-byte big-endian size indicator: num * 0x20
+    out.extend_from_slice(&ids_bytes.to_be_bytes());
     // 5) identificadores de 32 bytes
     for id in ids_to_delete {
         out.extend_from_slice(id);
@@ -268,45 +313,30 @@ pub fn build_check_payload(
         &CMD_CHECK_PREFIX_TYPE1
     };
 
-    let total_len = 6
-        + prefix.len()
-        + SDCP_NONCE_SIZE
-        + (num * SDCP_ENROLLMENT_ID_SIZE)
-        + CMD_CHECK_SUFFIX.len();
+    let data_len = (num + 1)
+        .checked_mul(SDCP_ENROLLMENT_ID_SIZE)
+        .expect("check payload size overflow");
+    let data_bytes = u16::try_from(data_len).expect("check payload exceeds u16");
+    let outer_len = data_bytes
+        .checked_add(0x09)
+        .expect("check outer length exceeds u16");
+    let total_len = 6 + prefix.len() + data_len + CMD_CHECK_SUFFIX.len();
     let mut out = Vec::with_capacity(total_len);
 
     // 1) 00 00
     out.extend_from_slice(&[0x00, 0x00]);
-
-    // 2) 2-byte size counter: (num + 1) * 0x20 + 0x09
-    if num > 6 {
-        out.push(0x01);
-        out.push((((num - 7) * 0x20) + 0x09) as u8);
-    } else {
-        out.push(0x00);
-        out.push((((num + 1) * 0x20) + 0x09) as u8);
-    }
-
+    // 2) 2-byte big-endian size counter: (num + 1) * 0x20 + 0x09
+    out.extend_from_slice(&outer_len.to_be_bytes());
     // 3) prefix según variante (Type1 vs Type2)
     out.extend_from_slice(prefix);
-
-    // 4) 2-byte size counter: (num + 1) * 0x20
-    if num > 6 {
-        out.push(0x01);
-        out.push(((num - 7) * 0x20) as u8);
-    } else {
-        out.push(0x00);
-        out.push(((num + 1) * 0x20) as u8);
-    }
-
+    // 4) 2-byte big-endian size counter: (num + 1) * 0x20
+    out.extend_from_slice(&data_bytes.to_be_bytes());
     // 5) SDCP Identify nonce (32 bytes en 0x00 en estos sensores)
     out.extend_from_slice(&[0u8; SDCP_NONCE_SIZE]);
-
     // 6) Todos los enrollment_id registrados actualmente
     for id in enrolled_ids {
         out.extend_from_slice(id);
     }
-
     // 7) Sufijo 00 40
     out.extend_from_slice(&CMD_CHECK_SUFFIX);
     out
@@ -322,32 +352,73 @@ pub fn build_new_print_payload(enrollment_id: &[u8; SDCP_ENROLLMENT_ID_SIZE]) ->
 }
 
 /// Extrae la lista de `enrollment_id` de 32 bytes de la respuesta a `cmd_list`
-/// (`egismoc_list_fill_enrolled_ids_cb`), excluyendo los 2 bytes de sufijo `90 00`.
-pub fn parse_list_response(buffer_in: &[u8]) -> Result<Vec<[u8; SDCP_ENROLLMENT_ID_SIZE]>, ProtocolError> {
-    if buffer_in.len() < EGISMOC_READ_PREFIX.len() {
+/// (`egismoc_list_fill_enrolled_ids_cb`).
+///
+/// Formato observado en hardware real (`tests/egismoc*/custom.pcapng`):
+///
+/// ```text
+/// "SIGE" 00 00 00 01 | check(2) | len(4, BE) | enrollment_id(32) * n | 90 00   (n >= 1)
+/// "SIGE" 00 00 00 01 | check(2) | 00 00 00 02 | 65 fe                         (sin huellas)
+/// ```
+///
+/// El parseo es estricto a propósito: una respuesta de error, truncada o con un
+/// estado desconocido **no** debe interpretarse como "lista vacía". Si se hiciera,
+/// identify/verify devolverían `FP_DEVICE_ERROR_DATA_NOT_FOUND` y `fprintd`
+/// borraría del disco todas las huellas almacenadas
+/// ("Deleted stored finger ... as it is unknown to device").
+pub fn parse_list_response(
+    buffer_in: &[u8],
+) -> Result<Vec<[u8; SDCP_ENROLLMENT_ID_SIZE]>, ProtocolError> {
+    if buffer_in.len() < EGISMOC_LIST_RESPONSE_PREFIX_SIZE + EGISMOC_LIST_RESPONSE_SUFFIX_SIZE {
         return Err(ProtocolError::PacketTooShort);
     }
-    if buffer_in.len() < EGISMOC_LIST_RESPONSE_PREFIX_SIZE + EGISMOC_LIST_RESPONSE_SUFFIX_SIZE {
+    if buffer_in[..EGISMOC_READ_PREFIX.len()] != EGISMOC_READ_PREFIX {
+        return Err(ProtocolError::InvalidPrefix);
+    }
+
+    let len_start = EGISMOC_READ_PREFIX.len() + EGISMOC_CHECK_BYTES_LENGTH;
+    let mut len_be = [0u8; 4];
+    len_be.copy_from_slice(&buffer_in[len_start..EGISMOC_LIST_RESPONSE_PREFIX_SIZE]);
+    let declared_len = u32::from_be_bytes(len_be) as usize;
+
+    if declared_len < EGISMOC_LIST_RESPONSE_SUFFIX_SIZE {
+        return Err(ProtocolError::UnrecognizedResponse);
+    }
+    let Some(frame_end) = EGISMOC_LIST_RESPONSE_PREFIX_SIZE.checked_add(declared_len) else {
+        return Err(ProtocolError::UnrecognizedResponse);
+    };
+    if frame_end > buffer_in.len() {
+        return Err(ProtocolError::PacketTooShort);
+    }
+
+    let status = &buffer_in[frame_end - EGISMOC_LIST_RESPONSE_SUFFIX_SIZE..frame_end];
+    let payload = &buffer_in
+        [EGISMOC_LIST_RESPONSE_PREFIX_SIZE..frame_end - EGISMOC_LIST_RESPONSE_SUFFIX_SIZE];
+
+    if payload.is_empty() && status == RSP_LIST_EMPTY_STATUS {
         return Ok(Vec::new());
     }
-
-    let payload_end = buffer_in.len() - EGISMOC_LIST_RESPONSE_SUFFIX_SIZE;
-    let mut ids = Vec::new();
-    let mut pos = EGISMOC_LIST_RESPONSE_PREFIX_SIZE;
-    while pos + SDCP_ENROLLMENT_ID_SIZE <= payload_end {
-        let mut id = [0u8; SDCP_ENROLLMENT_ID_SIZE];
-        id.copy_from_slice(&buffer_in[pos..pos + SDCP_ENROLLMENT_ID_SIZE]);
-        ids.push(id);
-        pos += SDCP_ENROLLMENT_ID_SIZE;
+    if status != RSP_LIST_SUCCESS_SUFFIX {
+        return Err(ProtocolError::InvalidSuffix);
+    }
+    if payload.is_empty() || !payload.len().is_multiple_of(SDCP_ENROLLMENT_ID_SIZE) {
+        return Err(ProtocolError::UnrecognizedResponse);
     }
 
-    Ok(ids)
+    let (ids, rest) = payload.as_chunks::<SDCP_ENROLLMENT_ID_SIZE>();
+    debug_assert!(rest.is_empty());
+    Ok(ids.to_vec())
 }
 
 /// Parsea la respuesta del comando `identify_check` (`egismoc_identify_check_cb`).
-pub fn parse_identify_check_response(buffer_in: &[u8]) -> Result<IdentifyCheckResult, ProtocolError> {
-    if buffer_in.len() < EGISMOC_READ_PREFIX.len() {
+pub fn parse_identify_check_response(
+    buffer_in: &[u8],
+) -> Result<IdentifyCheckResult, ProtocolError> {
+    if buffer_in.len() < EGISMOC_READ_PREFIX.len() + EGISMOC_CHECK_BYTES_LENGTH + 2 {
         return Err(ProtocolError::PacketTooShort);
+    }
+    if buffer_in[..EGISMOC_READ_PREFIX.len()] != EGISMOC_READ_PREFIX {
+        return Err(ProtocolError::InvalidPrefix);
     }
 
     if validate_response_suffix(buffer_in, &RSP_IDENTIFY_MATCH_SUFFIX) {
@@ -380,8 +451,36 @@ pub fn parse_identify_check_response(buffer_in: &[u8]) -> Result<IdentifyCheckRe
     }
 }
 
+/// Evalúa la respuesta del comando `Check` durante el enrolamiento (detección de duplicados):
+/// - `90 04` -> la huella aún no está registrada (`NotEnrolled`)
+/// - `90 00` -> la huella ya existe en el chip (`AlreadyEnrolled`)
+/// - cualquier otro estado o prefijo inválido -> error de protocolo (nunca falso duplicado).
+pub fn parse_enroll_check_response(buffer_in: &[u8]) -> Result<EnrollCheckResult, ProtocolError> {
+    if buffer_in.len() < EGISMOC_READ_PREFIX.len() + EGISMOC_CHECK_BYTES_LENGTH + 2 {
+        return Err(ProtocolError::PacketTooShort);
+    }
+    if buffer_in[..EGISMOC_READ_PREFIX.len()] != EGISMOC_READ_PREFIX {
+        return Err(ProtocolError::InvalidPrefix);
+    }
+    if validate_response_suffix(buffer_in, &RSP_CHECK_NOT_YET_ENROLLED_SUFFIX) {
+        Ok(EnrollCheckResult::NotEnrolled)
+    } else if validate_response_suffix(buffer_in, &RSP_IDENTIFY_MATCH_SUFFIX) {
+        Ok(EnrollCheckResult::AlreadyEnrolled)
+    } else {
+        Err(ProtocolError::UnrecognizedResponse)
+    }
+}
+
 /// Extrae el `enrollment_nonce` de 32 bytes de la respuesta a `cmd_enroll_starting`.
-pub fn parse_enroll_starting_response(buffer_in: &[u8]) -> Result<[u8; SDCP_NONCE_SIZE], ProtocolError> {
+pub fn parse_enroll_starting_response(
+    buffer_in: &[u8],
+) -> Result<[u8; SDCP_NONCE_SIZE], ProtocolError> {
+    if buffer_in.len() < EGISMOC_READ_PREFIX.len() {
+        return Err(ProtocolError::PacketTooShort);
+    }
+    if buffer_in[..EGISMOC_READ_PREFIX.len()] != EGISMOC_READ_PREFIX {
+        return Err(ProtocolError::InvalidPrefix);
+    }
     if !validate_response_suffix(buffer_in, &RSP_ENROLL_STARTING_SUFFIX) {
         return Err(ProtocolError::InvalidSuffix);
     }
@@ -402,6 +501,11 @@ pub fn parse_enroll_starting_response(buffer_in: &[u8]) -> Result<[u8; SDCP_NONC
 
 /// Evalúa la respuesta a `cmd_read_capture` (`egismoc_read_capture_cb`).
 pub fn parse_read_capture_response(buffer_in: &[u8]) -> CaptureReadStatus {
+    if buffer_in.len() < EGISMOC_READ_PREFIX.len() + EGISMOC_CHECK_BYTES_LENGTH + 2
+        || buffer_in[..EGISMOC_READ_PREFIX.len()] != EGISMOC_READ_PREFIX
+    {
+        return CaptureReadStatus::RetryUnknown;
+    }
     if validate_response_suffix(buffer_in, &RSP_READ_SUCCESS_SUFFIX) {
         CaptureReadStatus::Success
     } else if validate_response_suffix(buffer_in, &RSP_READ_OFFCENTER_SUFFIX) {
@@ -415,6 +519,12 @@ pub fn parse_read_capture_response(buffer_in: &[u8]) -> CaptureReadStatus {
 
 /// Extrae la cadena de versión de firmware de la respuesta a `cmd_fw_version`.
 pub fn parse_fw_version_response(buffer_in: &[u8]) -> Result<String, ProtocolError> {
+    if buffer_in.len() < EGISMOC_READ_PREFIX.len() {
+        return Err(ProtocolError::PacketTooShort);
+    }
+    if buffer_in[..EGISMOC_READ_PREFIX.len()] != EGISMOC_READ_PREFIX {
+        return Err(ProtocolError::InvalidPrefix);
+    }
     if !validate_response_suffix(buffer_in, &RSP_FW_VERSION_SUFFIX) {
         return Err(ProtocolError::InvalidSuffix);
     }
@@ -431,6 +541,85 @@ pub fn parse_fw_version_response(buffer_in: &[u8]) -> Result<String, ProtocolErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Construye una respuesta `cmd_list` con el campo de longitud correcto.
+    fn list_frame(ids: &[&[u8; SDCP_ENROLLMENT_ID_SIZE]], status: &[u8; 2]) -> Vec<u8> {
+        let payload_len = ids.len() * SDCP_ENROLLMENT_ID_SIZE + status.len();
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&EGISMOC_READ_PREFIX);
+        frame.extend_from_slice(&[0x00, 0x00]); // check bytes (no validados en lectura)
+        frame.extend_from_slice(&(payload_len as u32).to_be_bytes());
+        for id in ids {
+            frame.extend_from_slice(*id);
+        }
+        frame.extend_from_slice(status);
+        frame
+    }
+
+    #[test]
+    fn test_parse_list_real_empty_response() {
+        // Capturado de hardware real (1c7a:0582) sin huellas registradas.
+        let rsp = [
+            0x53, 0x49, 0x47, 0x45, 0x00, 0x00, 0x00, 0x01, 0xff, 0x6f, 0x00, 0x00, 0x00, 0x02,
+            0x65, 0xfe,
+        ];
+        assert_eq!(parse_list_response(&rsp), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn test_parse_list_ignores_trailing_bytes_after_declared_length() {
+        let id = [0x33u8; 32];
+        let mut rsp = list_frame(&[&id], &RSP_LIST_SUCCESS_SUFFIX);
+        rsp.extend_from_slice(&[0u8; 7]);
+        assert_eq!(parse_list_response(&rsp), Ok(vec![id]));
+    }
+
+    #[test]
+    fn test_parse_list_error_status_is_not_an_empty_list() {
+        // Regresión: una respuesta de error (p. ej. tras un reset USB) se
+        // interpretaba como "0 huellas" -> DATA_NOT_FOUND -> fprintd borraba
+        // las huellas almacenadas en /var/lib/fprint.
+        for status in [[0x6a, 0x80], [0x69, 0x85], [0x90, 0x04]] {
+            let rsp = list_frame(&[], &status);
+            assert!(parse_list_response(&rsp).is_err(), "status {status:02x?}");
+        }
+        // `90 00` sin ningún ID tampoco es un vacío legítimo.
+        assert!(parse_list_response(&list_frame(&[], &RSP_LIST_SUCCESS_SUFFIX)).is_err());
+    }
+
+    #[test]
+    fn test_parse_list_rejects_truncated_and_malformed_frames() {
+        let id = [0x44u8; 32];
+        let full = list_frame(&[&id, &id], &RSP_LIST_SUCCESS_SUFFIX);
+
+        // Truncada en cualquier punto -> error, nunca lista vacía o parcial.
+        for cut in [0, 8, 13, 15, 16, 40, full.len() - 1] {
+            assert!(parse_list_response(&full[..cut]).is_err(), "cut at {cut}");
+        }
+
+        // Prefijo incorrecto.
+        let mut bad_prefix = full.clone();
+        bad_prefix[0] = b'E';
+        assert_eq!(
+            parse_list_response(&bad_prefix),
+            Err(ProtocolError::InvalidPrefix)
+        );
+
+        // Payload que no es múltiplo de 32 bytes.
+        let mut odd = list_frame(&[&id], &RSP_LIST_SUCCESS_SUFFIX);
+        odd.insert(EGISMOC_LIST_RESPONSE_PREFIX_SIZE, 0xaa);
+        let len = (SDCP_ENROLLMENT_ID_SIZE + 1 + 2) as u32;
+        odd[10..14].copy_from_slice(&len.to_be_bytes());
+        assert_eq!(
+            parse_list_response(&odd),
+            Err(ProtocolError::UnrecognizedResponse)
+        );
+
+        // Longitud declarada absurda.
+        let mut huge = full.clone();
+        huge[10..14].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(parse_list_response(&huge).is_err());
+    }
 
     #[test]
     fn test_cmd_fw_version_and_cmd_list_wrapping_and_checksums() {
@@ -506,11 +695,7 @@ mod tests {
     fn test_parse_list_and_identify_responses() {
         let id1 = [0x11u8; 32];
         let id2 = [0x22u8; 32];
-        let mut list_rsp = vec![0u8; EGISMOC_LIST_RESPONSE_PREFIX_SIZE];
-        list_rsp[..8].copy_from_slice(&EGISMOC_READ_PREFIX);
-        list_rsp.extend_from_slice(&id1);
-        list_rsp.extend_from_slice(&id2);
-        list_rsp.extend_from_slice(&[0x90, 0x00]);
+        let list_rsp = list_frame(&[&id1, &id2], &RSP_LIST_SUCCESS_SUFFIX);
 
         let parsed_ids = parse_list_response(&list_rsp).unwrap();
         assert_eq!(parsed_ids, vec![id1, id2]);
@@ -530,5 +715,54 @@ mod tests {
                 enrollment_id: id1,
             }
         );
+    }
+
+    #[test]
+    fn test_parse_enroll_check_distinguishes_duplicate_vs_protocol_error() {
+        let mut not_enrolled = EGISMOC_READ_PREFIX.to_vec();
+        not_enrolled.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x90, 0x04]);
+        assert_eq!(
+            parse_enroll_check_response(&not_enrolled),
+            Ok(EnrollCheckResult::NotEnrolled)
+        );
+
+        let mut dup = EGISMOC_READ_PREFIX.to_vec();
+        dup.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x90, 0x00]);
+        assert_eq!(
+            parse_enroll_check_response(&dup),
+            Ok(EnrollCheckResult::AlreadyEnrolled)
+        );
+
+        let mut proto_err = EGISMOC_READ_PREFIX.to_vec();
+        proto_err.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x6a, 0x80]);
+        assert_eq!(
+            parse_enroll_check_response(&proto_err),
+            Err(ProtocolError::UnrecognizedResponse)
+        );
+
+        let mut bad_prefix = not_enrolled.clone();
+        bad_prefix[0] = b'X';
+        assert_eq!(
+            parse_enroll_check_response(&bad_prefix),
+            Err(ProtocolError::InvalidPrefix)
+        );
+    }
+
+    #[test]
+    fn test_verify_frame_checksum_and_validate_sige_ack() {
+        // Trama real capturada del hardware 1c7a:0582 (lista vacía: 65 fe)
+        let real_empty = [
+            0x53, 0x49, 0x47, 0x45, 0x00, 0x00, 0x00, 0x01, 0xff, 0x6f, 0x00, 0x00, 0x00, 0x02,
+            0x65, 0xfe,
+        ];
+        assert!(verify_frame_checksum(&real_empty));
+        let mut corrupted = real_empty;
+        corrupted[15] ^= 0x01;
+        assert!(!verify_frame_checksum(&corrupted));
+
+        let mut armed = EGISMOC_READ_PREFIX.to_vec();
+        armed.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x91, 0x00]);
+        assert!(validate_sige_ack(&armed, &[RSP_STATUS_ARMED, RSP_STATUS_OK]).is_ok());
+        assert!(validate_sige_ack(&armed, &[RSP_STATUS_OK]).is_err());
     }
 }

@@ -4,7 +4,7 @@
 [![License: LGPL-2.1-or-later](https://img.shields.io/badge/License-LGPL_2.1--or--later-blue.svg)](https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html)
 [![Rust](https://img.shields.io/badge/Rust-2021_Edition-orange.svg)](https://www.rust-lang.org/)
 
-A memory-safe, **Sans-I/O Rust driver core** and **Microsoft SDCP (Secure Device Connection Protocol)** implementation for **Egis Technology (LighTuning) Match-on-Chip** fingerprint sensors (`1c7a:0582` – `1c7a:05a5`), statically linked into `libfprint-2.so.2.0.0` via a minimalist C GObject bridge.
+A memory-safe, **100% pure-Rust driver** (Sans-I/O state machine, Microsoft SDCP cryptography, and native Rust GObject/USB adapter — **0 lines of C in the driver**) for **Egis Technology (LighTuning) Match-on-Chip** fingerprint sensors (`1c7a:0582` – `1c7a:05a5`), statically linked directly into `libfprint-2.so.2.0.0`.
 
 Tested and verified on **Samsung Galaxy Book2 Pro 360 (`930QED`, sensor `1c7a:0582` `ETU905A80-E`)** running Arch Linux (GNOME Lock Screen / GDM, `sudo`, Polkit, and `fprintd`).
 
@@ -27,9 +27,10 @@ The original C reference implementation (`libfprint-egismoc-sdcp`) combines manu
 
 | Feature / Metric | Original C Reference Driver (`libfprint-egismoc-sdcp`) | **`libfprint-egismoc-rs` (Rust Core + C Bridge)** |
 | :--- | :--- | :--- |
-| **C Code Attack Surface** | **4,455 LoC** (`egismoc.c/.h` + `fpi-sdcp-device.c/.h`) with manual pointer arithmetic and `memcpy`. | **669 LoC** thin GObject/USB shim (**-85% reduction in C code**). Zero `unsafe` blocks in protocol or state machine modules. |
-| **State Machine & Cancellation** | 3 nested `FpiSsm` callback chains (`task_ssm`, `cmd_ssm`, `wait_finger_ssm`). Prone to `SIGABRT` (`self->task_ssm == NULL`) when cancelled mid-wait. | **Single Sans-I/O Rust `enum TaskState`** driven by `step()`. Cancellation is simply `self.task = None`—dangling states are impossible by construction. |
-| **USB Reset & Autosuspend Recovery** | Fails immediately on first `sudo` attempt (`Device SDCP Identify response was not valid`) and stays broken until `sdcp-claim` expires (24h) or reboot. | **Self-healing SDCP channel**: accepts the hardware-verified 32-byte `enrollment_id` on `MacMismatchAfterReset` **and automatically invalidates the stale `sdcp-claim`** so the next operation performs a fresh `SDCP Connect` handshake. |
+| **C Code Attack Surface** | **4,455 LoC** (`egismoc.c/.h` + `fpi-sdcp-device.c/.h`) with manual pointer arithmetic and `memcpy`. | **0 LoC of C in the driver** (**-100% C reduction**). Protocol and state machine modules enforce `#![forbid(unsafe_code)]`; GObject/USB ABI layouts are verified at compile time with `const` `size_of`/`offset_of!` assertions. |
+| **State Machine & Cancellation** | 3 nested `FpiSsm` callback chains (`task_ssm`, `cmd_ssm`, `wait_finger_ssm`). Prone to `SIGABRT` (`self->task_ssm == NULL`) when cancelled mid-wait. | **Single Sans-I/O Rust `enum TaskState`** driven by `step()`. Cancellation is simply `self.task = None`, with cancellation-race guards and proper `suspend`/`resume` handling per `libfprint` contract. |
+| **USB Reset & Autosuspend Recovery** | Fails immediately on first `sudo` attempt (`Device SDCP Identify response was not valid`) and stays broken until `sdcp-claim` expires (24h) or reboot. | **Proactive + self-healing SDCP channel**: invalidates stale volatile SDCP claims on USB reset (`open`) and system `suspend`/`resume` (achieving full `Verified` MAC on first try), retains `MacMismatchAfterReset` fallback, and ships a udev rule disabling aggressive USB autosuspend on `1c7a:0582`–`05a5`. |
+| **Strict Protocol Parsing** | Error or truncated `CMD_LIST` replies could look like "0 prints", causing `fprintd` to delete `/var/lib/fprint`. | Strictly validates `SIGE` framing, big-endian lengths, and exact status words (`90 00`, `65 fe`, `90 04`) so transient errors never wipe enrolled prints or trigger false duplicates. |
 | **Enrollment after USB Reset** | Skips `SDCP Connect` during enrollment if a stale `sdcp-claim` exists on disk, causing `EnrollCommit` rejection. | Always performs a fresh `SDCP Connect` key agreement during hardware enrollment so `enrollment_id` generation is 100% synchronized with the sensor. |
 | **ASN.1 DER & Packet Parsing** | Uses `g_assert()` on raw USB bytes (`fpi_sdcp_get_cert_length_from_buf`), crashing `fprintd` on truncated/malformed packets. | Bounds-checked slices + `checked_add` arithmetic returning typed `Result<_, SdcpError>`—never panics or aborts on malformed USB input. |
 | **Cryptographic RAM Hygiene** | `fpi_sdcp_device_finalize()` frees heap buffers with `g_free()` without scrubbing ECDH private keys or `application_secret` in RAM. | Implements `Drop` on `SdcpSession` using `std::ptr::write_volatile` + `compiler_fence(Ordering::SeqCst)` to deterministically zeroize all private keys and derived secrets in RAM. |
@@ -45,17 +46,18 @@ The original C reference implementation (`libfprint-egismoc-sdcp`) combines manu
 ┌───────────────────────────────────────────────────────────────────────────┐
 │                         libfprint-2.so.2.0.0                              │
 │                                                                           │
-│  ┌─────────────────────────────────┐      ┌────────────────────────────┐  │
-│  │   GObject Bridge (c-bridge/)    │      │  egismoc-core (Rust .a)    │  │
-│  │   egismoc.c (~639 LoC)          │      │                            │  │
-│  │                                 │ step │  • state.rs (Sans-I/O)     │  │
-│  │  • Registers FpiDeviceEgisMoc   ├─────►│    TaskState::Probe/List/  │  │
-│  │  • Dispatches FpiUsbTransfer    │      │    Identify/Enroll/Delete  │  │
-│  │    (Control / Bulk / Interrupt) │◄─────┤  • protocol.rs             │  │
-│  │  • Reports to libfprint         │Action│    EGIS Framing + Checksum │  │
-│  │    (progress, match, errors)    │      │  • sdcp.rs                 │  │
-│  └─────────────────────────────────┘      │    ECDH P-256 + KBKDF      │  │
-│                                           └────────────────────────────┘  │
+│  fpi-drivers.c ──► fpi_device_egismoc_get_type() [100% Rust staticlib]    │
+│                                                                           │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │                     egismoc-core (Rust .a)                          │  │
+│  │                                                                     │  │
+│  │  • gobject_usb.rs + glib_ffi.rs (ABI-verified GObject/USB adapter)  │  │
+│  │    Registers FpiDeviceEgisMoc, dispatches FpiUsbTransfer, handles   │  │
+│  │    probe/open/close/cancel/suspend/resume/enroll/verify/identify    │  │
+│  │  • state.rs   (#![forbid(unsafe_code)] Sans-I/O TaskState FSM)      │  │
+│  │  • protocol.rs (#![forbid(unsafe_code)] EGIS/SIGE framing + parser) │  │
+│  │  • sdcp.rs    (ECDH P-256 + SP800-108 KBKDF + atomic claim cache)   │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -124,13 +126,14 @@ meson test -C pkg_build --print-errorlogs
 
 | Path | Description |
 | :--- | :--- |
-| [`egismoc-core/src/sdcp.rs`](egismoc-core/src/sdcp.rs) | Pure-Rust Microsoft SDCP implementation: ECDH P-256, SP800-108 Counter KBKDF (`HMAC-SHA256`), ASN.1 DER length parser, `Drop` zeroization, and `MacMismatchAfterReset` self-healing. |
-| [`egismoc-core/src/protocol.rs`](egismoc-core/src/protocol.rs) | Command constants, `EGIS`/`SIGE` framing, 16-bit one's complement checksum (`egismoc_write_check_bytes`), and response parsers. |
-| [`egismoc-core/src/state.rs`](egismoc-core/src/state.rs) | Deterministic Sans-I/O state machine (`Probe`, `List`, `Identify`, `Enroll`, `Delete`, `ClearStorage`). |
-| [`egismoc-core/src/ffi.rs`](egismoc-core/src/ffi.rs) | C ABI (`extern "C"`) boundary exported as `libegismoc_core.a`. |
-| [`egismoc-core/include/egismoc_rs.h`](egismoc-core/include/egismoc_rs.h) | C header defining `EgisMocRs`, `EgisMocAction`, and FFI entry points. |
-| [`c-bridge/egismoc.c`](c-bridge/egismoc.c) | Minimalist `libfprint` GObject bridge dispatching `FpiUsbTransfer` actions for `egismoc-core`. |
-| [`patches/meson-egismoc-rs.patch`](patches/meson-egismoc-rs.patch) | Meson build patch linking `libegismoc_core.a` into `libfprint`. |
+| [`egismoc-core/src/gobject_usb.rs`](egismoc-core/src/gobject_usb.rs) | 100% pure-Rust `FpiDeviceEgisMoc` GObject subclass and `FpiUsbTransfer` USB adapter exporting `fpi_device_egismoc_get_type`. |
+| [`egismoc-core/src/glib_ffi.rs`](egismoc-core/src/glib_ffi.rs) | Compile-time ABI-verified (`size_of` / `offset_of!`) bindings for GLib, GObject, GUsb, and `libfprint` internal `fpi_*` APIs. |
+| [`egismoc-core/src/sdcp.rs`](egismoc-core/src/sdcp.rs) | `#![forbid(unsafe_code)]` Microsoft SDCP: ECDH P-256, SP800-108 Counter KBKDF (`HMAC-SHA256`), `subtle` constant-time MACs, `zeroize` RAM scrubbing, symlink-safe atomic claim cache, and `MacMismatchAfterReset` self-healing. |
+| [`egismoc-core/src/protocol.rs`](egismoc-core/src/protocol.rs) | `#![forbid(unsafe_code)]` command constants, `EGIS`/`SIGE` framing, 16-bit one's complement checksum, and strict response/ACK parsers. |
+| [`egismoc-core/src/state.rs`](egismoc-core/src/state.rs) | `#![forbid(unsafe_code)]` deterministic Sans-I/O state machine (`Probe`, `List`, `Identify`, `Enroll`, `Delete`, `ClearStorage`) with strict intermediate ACK validation. |
+| [`system/71-egismoc-no-autosuspend.rules`](system/71-egismoc-no-autosuspend.rules) | udev rule disabling aggressive USB autosuspend on `1c7a:0582`–`05a5`. |
+| [`system/90-egismoc-restart-fprintd.hook`](system/90-egismoc-restart-fprintd.hook) | Arch Linux ALPM hook to restart `fprintd.service` automatically after updates. |
+| [`patches/meson-egismoc-rs.patch`](patches/meson-egismoc-rs.patch) | Meson build patch linking `libegismoc_core.a` directly with zero C driver sources. |
 | [`aur/PKGBUILD`](aur/PKGBUILD) | Standalone Arch User Repository (`AUR`) build script. |
 
 ---

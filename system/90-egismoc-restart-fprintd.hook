@@ -1,0 +1,11 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = libfprint-egismoc-rs-git
+Target = fprintd
+
+[Action]
+Description = Restarting fprintd after fingerprint stack update...
+When = PostTransaction
+Exec = /usr/bin/systemctl try-restart fprintd.service
