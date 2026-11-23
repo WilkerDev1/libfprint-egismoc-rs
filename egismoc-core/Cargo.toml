@@ -10,10 +10,10 @@ name = "egismoc_core"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-p256 = { version = "0.13", default-features = false, features = ["ecdh", "arithmetic"] }
-hmac = "0.12"
-sha2 = "0.10"
-getrandom = "0.2"
+p256 = { version = "0.14", default-features = false, features = ["ecdh", "arithmetic"] }
+hmac = "0.13"
+sha2 = "0.11"
+getrandom = "0.4"
 subtle = { version = "2", default-features = false }
 zeroize = { version = "1", default-features = false }
 

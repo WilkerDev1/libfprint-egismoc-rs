@@ -13,9 +13,9 @@
 #![forbid(unsafe_code)]
 
 use crate::is_emulation_mode;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use p256::ecdh::diffie_hellman;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::{PublicKey, SecretKey};
 use sha2::{Digest, Sha256};
 use std::fs::{self, DirBuilder, OpenOptions};
@@ -270,7 +270,7 @@ pub fn get_cert_length_from_buf(buf: &[u8]) -> Result<usize, SdcpError> {
 /// Genera 32 bytes aleatorios criptográficamente seguros (`r_h`, nonces).
 pub fn generate_random() -> Result<[u8; SDCP_RANDOM_SIZE], SdcpError> {
     let mut buf = [0u8; SDCP_RANDOM_SIZE];
-    getrandom::getrandom(&mut buf).map_err(|_| SdcpError::RngFailure)?;
+    getrandom::fill(&mut buf).map_err(|_| SdcpError::RngFailure)?;
     Ok(buf)
 }
 
@@ -443,7 +443,7 @@ impl SdcpSession {
         } else {
             let mut candidate = [0u8; SDCP_PRIVATE_KEY_SIZE];
             let sk = loop {
-                getrandom::getrandom(&mut candidate).map_err(|_| SdcpError::RngFailure)?;
+                getrandom::fill(&mut candidate).map_err(|_| SdcpError::RngFailure)?;
                 if let Ok(sk) = SecretKey::from_slice(&candidate) {
                     break sk;
                 }
@@ -457,7 +457,7 @@ impl SdcpSession {
         sk_bytes.zeroize();
 
         let public_key = secret_key.public_key();
-        let encoded_pub = public_key.to_encoded_point(false);
+        let encoded_pub = public_key.to_sec1_point(false);
         let pub_bytes = encoded_pub.as_bytes();
         if pub_bytes.len() != SDCP_PUBLIC_KEY_SIZE {
             return Err(SdcpError::InvalidPublicKey);
@@ -578,7 +578,7 @@ impl SdcpSession {
         // Escritura atómica resistente a ataques de symlink: O_CREAT | O_EXCL (create_new)
         // con sufijo aleatorio + permisos 0600 + fsync + rename.
         let mut nonce = [0u8; 8];
-        getrandom::getrandom(&mut nonce).map_err(|_| SdcpError::RngFailure)?;
+        getrandom::fill(&mut nonce).map_err(|_| SdcpError::RngFailure)?;
         let nonce_u64 = u64::from_le_bytes(nonce);
         let tmp_name = format!(
             ".{}.tmp.{}.{:016x}",
