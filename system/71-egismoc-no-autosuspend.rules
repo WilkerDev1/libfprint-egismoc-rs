@@ -1,0 +1,3 @@
+# Disable aggressive USB autosuspend on Egis Technology Match-on-Chip sensors (1c7a:0582 - 1c7a:05a5)
+# Prevents frequent USB runtime-suspend cycles from dropping the volatile SDCP session or wedging the sensor.
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="1c7a", ATTR{idProduct}=="0582|0583|0584|0586|0587|05a1|05a5", TEST=="power/control", ATTR{power/control}="on", TEST=="power/autosuspend", ATTR{power/autosuspend}="-1"

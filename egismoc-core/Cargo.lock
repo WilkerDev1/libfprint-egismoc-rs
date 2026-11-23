@@ -89,6 +89,8 @@ dependencies = [
  "hmac",
  "p256",
  "sha2",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]

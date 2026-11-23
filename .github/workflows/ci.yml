@@ -26,12 +26,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "egismoc-core -> target"
+      - name: Check Formatting
+        run: cargo fmt --all -- --check
       - name: Run Clippy (strict)
         run: cargo clippy --all-targets -- -D warnings
       - name: Run Unit Tests
-        run: cargo test --verbose
+        run: cargo test --locked --verbose
       - name: Build Release Staticlib
-        run: cargo build --release
+        run: cargo build --release --locked
 
   security-audit:
     name: Cargo Security Audit (RustSec)

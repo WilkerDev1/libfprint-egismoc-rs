@@ -4,18 +4,21 @@
 //! `Delete`, `ClearStorage`) avanza exclusivamente a través de `step(&mut self, rx: Option<&[u8]>) -> Action`,
 //! sin realizar llamadas de E/S ni depender de `FpiSsm` o `GMainLoop`.
 
+#![forbid(unsafe_code)]
+
+use crate::is_emulation_mode;
 use crate::protocol::{
-    build_check_payload, build_delete_payload, build_new_print_payload,
-    build_sdcp_connect_payload, is_finger_present_interrupt, parse_enroll_starting_response,
+    build_check_payload, build_delete_payload, build_new_print_payload, build_sdcp_connect_payload,
+    is_finger_present_interrupt, parse_enroll_check_response, parse_enroll_starting_response,
     parse_fw_version_response, parse_identify_check_response, parse_list_response,
     parse_read_capture_response, validate_response_prefix, validate_response_suffix,
-    wrap_egui_frame, CaptureReadStatus, IdentifyCheckResult, CMD_CAPTURE_POST_WAIT_FINGER,
-    CMD_COMMIT_STARTING, CMD_ENROLL_STARTING, CMD_FW_VERSION, CMD_LIST, CMD_READ_CAPTURE,
-    CMD_SENSOR_CHECK, CMD_SENSOR_ENROLL, CMD_SENSOR_IDENTIFY, CMD_SENSOR_RESET,
-    CMD_SENSOR_START_CAPTURE, EGISMOC_DRIVER_CHECK_PREFIX_TYPE2,
+    validate_sige_ack, wrap_egui_frame, CaptureReadStatus, EnrollCheckResult, IdentifyCheckResult,
+    CMD_CAPTURE_POST_WAIT_FINGER, CMD_COMMIT_STARTING, CMD_ENROLL_STARTING, CMD_FW_VERSION,
+    CMD_LIST, CMD_READ_CAPTURE, CMD_SENSOR_CHECK, CMD_SENSOR_ENROLL, CMD_SENSOR_IDENTIFY,
+    CMD_SENSOR_RESET, CMD_SENSOR_START_CAPTURE, EGISMOC_DRIVER_CHECK_PREFIX_TYPE2,
     EGISMOC_DRIVER_MAX_ENROLL_STAGES_15, EGISMOC_DRIVER_MAX_ENROLL_STAGES_20,
-    EGISMOC_MAX_ENROLL_NUM, EGISMOC_MAX_ENROLL_STAGES_DEFAULT,
-    RSP_CHECK_NOT_YET_ENROLLED_SUFFIX, RSP_COMMIT_SUCCESS_SUFFIX, RSP_DELETE_SUCCESS_PREFIX,
+    EGISMOC_MAX_ENROLL_NUM, EGISMOC_MAX_ENROLL_STAGES_DEFAULT, RSP_COMMIT_SUCCESS_SUFFIX,
+    RSP_DELETE_SUCCESS_PREFIX, RSP_STATUS_ARMED, RSP_STATUS_NO_MATCH, RSP_STATUS_OK,
 };
 use crate::sdcp::{
     IdentityVerification, SdcpConnectResponse, SdcpSession, SDCP_ENROLLMENT_ID_SIZE,
@@ -211,6 +214,11 @@ pub enum TaskState {
     },
 }
 
+#[inline]
+fn check_ack(rx: Option<&[u8]>, allowed_statuses: &[[u8; 2]]) -> bool {
+    rx.is_some_and(|b| validate_sige_ack(b, allowed_statuses).is_ok())
+}
+
 /// Instancia principal Sans-I/O del driver Egis Match-on-Chip.
 pub struct EgisMocDriver {
     pub model_variant: ModelVariant,
@@ -269,6 +277,16 @@ impl EgisMocDriver {
     /// Hace imposible el fallo `assertion failed: (self->task_ssm == NULL)` de la versión en C.
     pub fn cancel(&mut self) {
         self.task = None;
+    }
+
+    /// Invalida la sesión SDCP volátil y el archivo `sdcp-claim` en caché (excepto en modo emulación
+    /// `FP_DEVICE_EMULATION=1` donde las capturas `umockdev` esperan reutilizar el claim pre-sembrado).
+    /// Debe llamarse tras un reinicio de bus USB o suspensión del sistema para forzar un handshake
+    /// `SDCP Connect` limpio y garantizar verificación criptográfica completa (`Verified`).
+    pub fn invalidate_sdcp_on_hardware_reset(&mut self) {
+        if !is_emulation_mode() {
+            self.sdcp.invalidate_session();
+        }
     }
 
     pub fn start_probe(&mut self) {
@@ -426,9 +444,9 @@ impl EgisMocDriver {
                             max_enroll_stages: self.max_enroll_stages,
                         })
                     }
-                    Err(_) => Action::Error(DriverError::Proto(
-                        "Device firmware response was not valid",
-                    )),
+                    Err(_) => {
+                        Action::Error(DriverError::Proto("Device firmware response was not valid"))
+                    }
                 }
             }
         }
@@ -540,6 +558,11 @@ impl EgisMocDriver {
                 }
             }
             IdentifyStep::WaitSensorReset => {
+                if !check_ack(rx, &[RSP_STATUS_OK]) {
+                    return Action::Error(DriverError::Proto(
+                        "Sensor reset rejected during identify",
+                    ));
+                }
                 self.task = Some(TaskState::Identify {
                     step: IdentifyStep::WaitSensorIdentify,
                 });
@@ -550,6 +573,9 @@ impl EgisMocDriver {
                 }
             }
             IdentifyStep::WaitSensorIdentify => {
+                if !check_ack(rx, &[RSP_STATUS_ARMED, RSP_STATUS_OK]) {
+                    return Action::Error(DriverError::Proto("Sensor failed to arm identify mode"));
+                }
                 self.task = Some(TaskState::Identify {
                     step: IdentifyStep::WaitFinger,
                 });
@@ -580,8 +606,10 @@ impl EgisMocDriver {
                 }
             }
             IdentifyStep::WaitSensorCheck => {
-                let payload =
-                    build_check_payload(&self.enrolled_ids, self.use_type2_check_prefix);
+                if !check_ack(rx, &[RSP_STATUS_OK]) {
+                    return Action::Error(DriverError::Proto("Sensor check preparation failed"));
+                }
+                let payload = build_check_payload(&self.enrolled_ids, self.use_type2_check_prefix);
                 self.task = Some(TaskState::Identify {
                     step: IdentifyStep::WaitCheck,
                 });
@@ -631,9 +659,9 @@ impl EgisMocDriver {
                             enroll_progress: None,
                         }
                     }
-                    Err(_) => Action::Error(DriverError::Proto(
-                        "Unrecognized response from device",
-                    )),
+                    Err(_) => {
+                        Action::Error(DriverError::Proto("Unrecognized response from device"))
+                    }
                 }
             }
             IdentifyStep::WaitCompleteSensorReset {
@@ -656,8 +684,7 @@ impl EgisMocDriver {
     ) -> Action {
         match step {
             EnrollStep::Start => {
-                let skip_connect = std::env::var("FP_DEVICE_EMULATION").as_deref() == Ok("1")
-                    && self.sdcp.is_connected();
+                let skip_connect = is_emulation_mode() && self.sdcp.is_connected();
                 if skip_connect {
                     self.task = Some(TaskState::Enroll {
                         step: EnrollStep::WaitEnrolledIds,
@@ -744,6 +771,11 @@ impl EgisMocDriver {
                 }
             }
             EnrollStep::WaitSensorReset => {
+                if !check_ack(rx, &[RSP_STATUS_OK]) {
+                    return Action::Error(DriverError::Proto(
+                        "Sensor reset rejected during enroll",
+                    ));
+                }
                 self.task = Some(TaskState::Enroll {
                     step: EnrollStep::WaitSensorEnroll,
                     stage,
@@ -757,6 +789,9 @@ impl EgisMocDriver {
                 }
             }
             EnrollStep::WaitSensorEnroll => {
+                if !check_ack(rx, &[RSP_STATUS_ARMED, RSP_STATUS_OK]) {
+                    return Action::Error(DriverError::Proto("Sensor failed to arm enroll mode"));
+                }
                 self.task = Some(TaskState::Enroll {
                     step: EnrollStep::WaitFinger,
                     stage,
@@ -796,8 +831,12 @@ impl EgisMocDriver {
                 }
             }
             EnrollStep::WaitSensorCheck => {
-                let payload =
-                    build_check_payload(&self.enrolled_ids, self.use_type2_check_prefix);
+                if !check_ack(rx, &[RSP_STATUS_OK]) {
+                    return Action::Error(DriverError::Proto(
+                        "Sensor check preparation failed during enroll",
+                    ));
+                }
+                let payload = build_check_payload(&self.enrolled_ids, self.use_type2_check_prefix);
                 self.task = Some(TaskState::Enroll {
                     step: EnrollStep::WaitCheck,
                     stage,
@@ -814,8 +853,16 @@ impl EgisMocDriver {
                 let Some(buf) = rx else {
                     return Action::Error(DriverError::Proto("Missing enroll check response"));
                 };
-                if !validate_response_suffix(buf, &RSP_CHECK_NOT_YET_ENROLLED_SUFFIX) {
-                    return Action::Error(DriverError::DataDuplicate);
+                match parse_enroll_check_response(buf) {
+                    Ok(EnrollCheckResult::NotEnrolled) => {}
+                    Ok(EnrollCheckResult::AlreadyEnrolled) => {
+                        return Action::Error(DriverError::DataDuplicate);
+                    }
+                    Err(_) => {
+                        return Action::Error(DriverError::Proto(
+                            "Unexpected response during duplicate check",
+                        ));
+                    }
                 }
                 self.task = Some(TaskState::Enroll {
                     step: EnrollStep::WaitEnrollStarting,
@@ -852,6 +899,11 @@ impl EgisMocDriver {
                 }
             }
             EnrollStep::WaitCaptureSensorReset => {
+                if !check_ack(rx, &[RSP_STATUS_OK]) {
+                    return Action::Error(DriverError::Proto(
+                        "Sensor reset rejected before capture",
+                    ));
+                }
                 self.task = Some(TaskState::Enroll {
                     step: EnrollStep::WaitCaptureSensorStart,
                     stage,
@@ -865,6 +917,9 @@ impl EgisMocDriver {
                 }
             }
             EnrollStep::WaitCaptureSensorStart => {
+                if !check_ack(rx, &[RSP_STATUS_ARMED, RSP_STATUS_OK]) {
+                    return Action::Error(DriverError::Proto("Sensor failed to start capture"));
+                }
                 self.task = Some(TaskState::Enroll {
                     step: EnrollStep::WaitCaptureFinger,
                     stage,
@@ -904,6 +959,11 @@ impl EgisMocDriver {
                 }
             }
             EnrollStep::WaitCapturePostWaitFinger => {
+                if !check_ack(rx, &[RSP_STATUS_OK]) {
+                    return Action::Error(DriverError::Proto(
+                        "Post-finger capture step rejected by sensor",
+                    ));
+                }
                 self.task = Some(TaskState::Enroll {
                     step: EnrollStep::WaitCaptureReadResponse,
                     stage,
@@ -957,6 +1017,9 @@ impl EgisMocDriver {
                 }
             }
             EnrollStep::WaitCommitStart => {
+                if !check_ack(rx, &[RSP_STATUS_NO_MATCH, RSP_STATUS_OK]) {
+                    return Action::Error(DriverError::Proto("Commit start rejected by sensor"));
+                }
                 let Ok(gen_id) = self.sdcp.generate_enrollment_id(&enrollment_nonce) else {
                     return Action::Error(DriverError::Proto("Failed to generate enrollment ID"));
                 };
@@ -1074,9 +1137,9 @@ mod tests {
     use super::*;
     use crate::protocol::{
         EGISMOC_ENROLL_STARTING_RESPONSE_PREFIX_SIZE, EGISMOC_IDENTIFY_RESPONSE_PREFIX_SIZE,
-        EGISMOC_READ_PREFIX, RSP_ENROLL_STARTING_SUFFIX,
-        RSP_FW_VERSION_SUFFIX, RSP_IDENTIFY_MATCH_SUFFIX, RSP_READ_SUCCESS_SUFFIX,
-        RSP_LIST_EMPTY_STATUS, RSP_LIST_SUCCESS_SUFFIX, RSP_SENSOR_HAS_FINGER_SUFFIX,
+        EGISMOC_READ_PREFIX, RSP_ENROLL_STARTING_SUFFIX, RSP_FW_VERSION_SUFFIX,
+        RSP_IDENTIFY_MATCH_SUFFIX, RSP_LIST_EMPTY_STATUS, RSP_LIST_SUCCESS_SUFFIX,
+        RSP_READ_SUCCESS_SUFFIX, RSP_SENSOR_HAS_FINGER_SUFFIX,
     };
 
     fn make_ok_resp() -> Vec<u8> {
@@ -1118,7 +1181,9 @@ mod tests {
         let mut err_rsp = EGISMOC_READ_PREFIX.to_vec();
         err_rsp.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x6a, 0x80]);
         match drv.step(Some(&err_rsp)) {
-            Action::Error(DriverError::DataNotFound(_)) => panic!("error status treated as empty list"),
+            Action::Error(DriverError::DataNotFound(_)) => {
+                panic!("error status treated as empty list")
+            }
             Action::Error(_) => {}
             other => panic!("Unexpected {:?}", other),
         }
@@ -1420,6 +1485,21 @@ mod tests {
                 assert_ne!(enrollment_id, [0u8; 32]);
             }
             other => panic!("Expected EnrollComplete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_intermediate_sensor_error_fails_fast_with_proto() {
+        let mut drv = EgisMocDriver::from_pid(0x0582);
+        drv.task = Some(TaskState::Identify {
+            step: IdentifyStep::WaitSensorIdentify,
+        });
+        let mut err_rsp = EGISMOC_READ_PREFIX.to_vec();
+        err_rsp.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x6a, 0x80]);
+
+        match drv.step(Some(&err_rsp)) {
+            Action::Error(DriverError::Proto(_)) => {}
+            other => panic!("Expected DriverError::Proto, got {:?}", other),
         }
     }
 }

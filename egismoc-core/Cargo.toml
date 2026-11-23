@@ -14,6 +14,8 @@ p256 = { version = "0.13", default-features = false, features = ["ecdh", "arithm
 hmac = "0.12"
 sha2 = "0.10"
 getrandom = "0.2"
+subtle = { version = "2", default-features = false }
+zeroize = { version = "1", default-features = false }
 
 [profile.release]
 opt-level = 3
